@@ -15,6 +15,8 @@ const Labels = {
   CATEGORY: "CATEGORY",
   CATEGORY_CAT: "CATEGORY_CAT",
   COFFEE_CATEGORY: "COFFEE_CATEGORY",
+  JSON_LIST: "JSON_LIST",
+  JSON_NAVIGATION: "JSON_NAVIGATION",
   LIST: "LIST"
 };
 
@@ -94,6 +96,63 @@ function getCoffeeCategory(country) {
     case "com.tr":
       return "Kahve";
   }
+}
+
+function prepareCategoryJsonUrl(path, country, page) {
+  return `https://www.tchibo.cz/service/categoryfrontend/api/categories/products?path=${path}&site=${country.toUpperCase()}&page=${page}&sorting=relevance`;
+}
+
+function jsonNavigationRequests({ json, country }) {
+  const requests = [];
+  const categories = json.categories.flatMap(category => category.children);
+  const page = 1;
+  for (const { href: path, title } of categories) {
+    requests.push({
+      url: prepareCategoryJsonUrl(path, country, page),
+      userData: {
+        label: Labels.JSON_LIST,
+        scraped: 0,
+        page,
+        path,
+        category: title,
+      },
+    })
+  }
+  return requests;
+}
+
+function productsFromJsonListing({ json, handledIdsSet, currency, country, userData: { category } }) {
+  const products = [];
+  const { metadata, items } = json;
+  const numProductsScraped = items.length;
+  const baseUrl = `https://www.tchibo.${country}`;
+  for (const item of items) {
+    if (handledIdsSet[item.id]) continue;
+    handledIdsSet[item.id] = true;
+    const {
+      id,
+      imageUrlSmallSize,
+      price,
+      productViewUrl,
+      title,
+    } = item;
+    const itemUrl = `${baseUrl}/${productViewUrl}`;
+    products.push({
+      itemId: id,
+      itemName: title,
+      itemUrl,
+      slug: itemSlug(itemUrl),
+      img: `${baseUrl}${imageUrlSmallSize}`,
+      // NOTE: `249,00Kč` is represented as 24900
+      originalPrice: price.bestPriceAmount / 100,
+      currentPrice: price.current / 100,
+      discounted: false,
+      currency,
+      category,
+    });
+  }
+  const { numFoundAvailable } = metadata;
+  return { products, numFoundAvailable, numProductsScraped };
 }
 
 function navigationRequests({ json, country }) {
@@ -277,11 +336,48 @@ async function main() {
     useSessionPool: true,
     persistCookiesPerSession: true,
     async requestHandler({ request, log, body, json }) {
-      const { label, page } = request.userData;
+      const { userData } = request;
+      const { label, page } = userData;
       const { document } = parseHTML(body.toString());
-      log.info(`Processing: [${label}] - [${request.url}]`);
+      log.info(`[${label}] - Processing [${request.url}]`);
 
       switch (label) {
+        case Labels.JSON_NAVIGATION: {
+          const requests = jsonNavigationRequests({ json, country });
+          log.info(`[${label}] - [${request.url}] - Found ${requests.length} categories`);
+          await crawler.addRequests(requests);
+          break;
+        }
+        case Labels.JSON_LIST: {
+          const { products, numFoundAvailable, numProductsScraped } = productsFromJsonListing({
+            json,
+            handledIdsSet,
+            currency,
+            country,
+            userData,
+          });
+
+          const scraped = userData.scraped + numProductsScraped;
+          const page = userData.page + 1;
+
+          log.info(`[${label}] - [${request.url}] - Found ${numProductsScraped} (${products.length} unique) products, total ${scraped}/${numFoundAvailable}`);
+          await Dataset.pushData(products);
+
+          const nextUserData = {
+            ...userData,
+            scraped,
+            page,
+          };
+
+          // we want to enqueue next page if `products` is not empty and we haven't reached `numFoundAvailable`
+          if (numProductsScraped > 0 && scraped < numFoundAvailable) {
+            const url = prepareCategoryJsonUrl(userData.path, country, page);
+            await crawler.addRequests([{
+              url,
+              userData: nextUserData,
+            }]);
+          }
+        }
         case Labels.LIST:
           {
             await crawler.addRequests(
@@ -323,6 +419,7 @@ async function main() {
                   label: Labels.COFFEE_CATEGORY
                 }
               }));
+            log.info(`[${label}] - [${request.url}] - Found ${products.length} products`);
             await Promise.allSettled([crawler.addRequests(subCategoriesRequests), Dataset.pushData(products)]);
           }
           break;
@@ -337,22 +434,33 @@ async function main() {
     }
   });
 
-  const startingRequest =
+  const startNavigationRequests = [
+    {
+      url: `https://www.tchibo.${country}/jsonflyoutnavigation`,
+      userData: {
+        label: Labels.NAVIGATION,
+      }
+    },
+    // most non-coffee categories & products are found at this enpoint
+    {
+      url: `https://www.tchibo.${country}/service/categoryfrontend/api/categories/navigation-tree?site=${country.toUpperCase()}`,
+      userData: {
+        label: Labels.JSON_NAVIGATION,
+      }
+    }
+  ];
+
+  const startingRequests =
     type === "test"
-      ? {
-          url: "https://www.tchibo.cz/lozni-pradlo-c400118928.html",
-          userData: {
-            label: Labels.LIST,
-            page: 0
-          }
+      ? [{
+        url: "https://www.tchibo.cz/lozni-pradlo-c400118928.html",
+        userData: {
+          label: Labels.LIST,
+          page: 0
         }
-      : {
-          url: `https://www.tchibo.${country}/jsonflyoutnavigation`,
-          userData: {
-            label: Labels.NAVIGATION
-          }
-        };
-  await crawler.run([startingRequest]);
+      }]
+      : startNavigationRequests;
+  await crawler.run(startingRequests);
   log.info("crawler finished");
 
   if (!development) {
